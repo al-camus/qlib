@@ -26,10 +26,13 @@ local coreDefaults = {
     },
     fuel = {
         enabled = true,
-        reserve = 100,
+        reserve = 0,
         lowPercent = 20,
         targetPercent = 100,
-        autoRefuel = true
+        autoRefuel = true,
+        -- -1 refuels only when empty, 0 disables automatic refueling, and
+        -- 1-100 refuels before a fuel-costing action when below that percent.
+        autoRefuelPercent = -1
     },
     keep = { reservedSlots = 0, autoCompact = true },
     talk = {
@@ -263,6 +266,22 @@ local function makeSerializableConfig()
     return { version = CONFIG_VERSION, values = deepClone(values) }
 end
 
+local function migrateLegacyFuelPolicy(storedValues)
+    local storedFuel = type(storedValues) == "table" and storedValues.fuel
+    if type(storedFuel) ~= "table" or storedFuel.autoRefuelPercent ~= nil then
+        return false
+    end
+
+    -- A missing threshold identifies the legacy policy. Its old 100-unit
+    -- default reserve would prevent emergency-only refueling from ever being
+    -- reached, so migrate that value while preserving all other custom fields.
+    if storedFuel.reserve == 100 then
+        storedFuel.reserve = 0
+    end
+    storedFuel.autoRefuelPercent = -1
+    return true
+end
+
 local function decodeConfig(path)
     if not fs.exists(path) then
         return nil, 'Configuration file "' .. path .. '" does not exist'
@@ -284,7 +303,8 @@ local function decodeConfig(path)
         return nil, "configuration contains no values table"
     end
 
-    return decoded.values
+    local migrated = migrateLegacyFuelPolicy(decoded.values)
+    return decoded.values, nil, migrated
 end
 
 local function replaceContents(target, source)
@@ -487,7 +507,7 @@ function load(path)
     local targetPath = path or storagePath
     assertStoragePath(targetPath)
 
-    local storedValues, loadError = decodeConfig(targetPath)
+    local storedValues, loadError, migrated = decodeConfig(targetPath)
     if storedValues then
         local merged, mergeError = mergeStoredValues(defaults, storedValues)
         if not merged then
@@ -495,11 +515,11 @@ function load(path)
         end
 
         values = merged
-        dirty = false
-        return true
+        dirty = migrated == true
+        return true, migrated and "Migrated legacy fuel defaults" or nil
     end
 
-    local backupValues = decodeConfig(targetPath .. ".bak")
+    local backupValues, _, backupMigrated = decodeConfig(targetPath .. ".bak")
     if backupValues then
         local merged, mergeError = mergeStoredValues(defaults, backupValues)
         if not merged then
@@ -508,7 +528,9 @@ function load(path)
 
         values = merged
         dirty = true
-        return true, "Loaded configuration from backup"
+        return true, backupMigrated and
+            "Loaded configuration from backup and migrated legacy fuel defaults" or
+            "Loaded configuration from backup"
     end
 
     return false, loadError
@@ -520,7 +542,20 @@ function initialize(path)
     end
 
     if fs.exists(storagePath) or fs.exists(storagePath .. ".bak") then
-        return load(storagePath)
+        local loaded, message = load(storagePath)
+        if not loaded then
+            return false, message
+        end
+
+        if dirty then
+            local saved, saveReason = save(storagePath)
+            if not saved then
+                return true, (message or "Configuration loaded") ..
+                    "; migration save failed: " .. tostring(saveReason)
+            end
+        end
+
+        return true, message
     end
 
     local success, reason = save(storagePath)
