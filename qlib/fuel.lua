@@ -171,6 +171,13 @@ function autoRefuelEnabled()
     return conf.get("fuel.autoRefuel", true) ~= false
 end
 
+-- -1 is the default emergency-only policy, 0 disables automatic attempts,
+-- and a positive value proactively refuels below that percentage.
+function autoRefuelPercent()
+    local configured = configNumber("fuel.autoRefuelPercent", -1)
+    return configured < 0 and -1 or clamp(configured, 0, 100)
+end
+
 function reserve()
     return math.max(math.floor(configNumber("fuel.reserve", 0)), 0)
 end
@@ -366,13 +373,14 @@ function require(steps)
 
     local fuelReserve = reserve()
     local canProceed, failureReason = movementStatus(normalized, fuelLevel, fuelReserve)
-    local fuelLimit
+    local automaticPercent = autoRefuelPercent()
+    local fuelLimit = rawLimit()
+    local shouldRefuel = normalized > 0 and autoRefuelEnabled() and (
+        (automaticPercent < 0 and fuelLevel <= 0) or
+        (automaticPercent > 0 and percentFor(fuelLevel, fuelLimit) < automaticPercent)
+    )
 
-    if autoRefuelEnabled() then
-        fuelLimit = rawLimit()
-    end
-
-    if fuelLimit and (not canProceed or lowAt(fuelLevel, fuelLimit, fuelReserve, lowPercent())) then
+    if shouldRefuel then
         local required = fuelReserve + normalized
         if required > fuelLimit then
             return false, "movement requires " .. required ..
@@ -409,7 +417,8 @@ function getState()
         low = enabled and lowAt(fuelLevel, fuelLimit, fuelReserve, lowThreshold),
         lowPercent = lowThreshold,
         targetPercent = targetPercent(),
-        autoRefuel = autoRefuelEnabled()
+        autoRefuel = autoRefuelEnabled(),
+        autoRefuelPercent = autoRefuelPercent()
     }
 end
 
