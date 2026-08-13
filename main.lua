@@ -18,6 +18,9 @@ local COLOR_MUTED = colors.lightGray
 local GPS_CHECK_INTERVAL = 1
 local GPS_CHECK_TIMEOUT = 0.25
 local GPS_MISS_LIMIT = 2
+-- CC:Tweaked rounds trilaterated GPS fixes to hundredths. A quarter-block
+-- tolerance absorbs that noise while still rejecting every real block move.
+local GPS_POSITION_TOLERANCE = 0.25
 
 local max = math.max
 local min = math.min
@@ -148,11 +151,16 @@ end
 
 local function setStatus(message, color)
     statusMessage = trim(message)
+    if statusMessage ~= "" and not statusMessage:match("[%.!?]$") then
+        statusMessage = statusMessage .. "."
+    end
     statusColor = color or COLOR_TEXT
 end
 
 local function setSuccess(message)
-    setStatus(message, COLOR_SUCCESS)
+    -- Successful command output is ordinary text. COLOR_SUCCESS remains an
+    -- accent for persistent state such as the calibrated indicator.
+    setStatus(message, COLOR_TEXT)
 end
 
 local function setWarning(message)
@@ -205,21 +213,40 @@ local function addArrowButton(buttons, center, row, glyph, action)
 end
 
 local function restartGpsTimer()
+    if gpsTimer and type(os.cancelTimer) == "function" then
+        pcall(os.cancelTimer, gpsTimer)
+    end
     gpsTimer = os.startTimer(GPS_CHECK_INTERVAL)
 end
 
-local function gpsAvailable()
+local function locateGps(timeout)
     if type(gps) ~= "table" or type(gps.locate) ~= "function" then
-        return false
+        return nil
     end
 
-    local ok, x, y, z = pcall(gps.locate, GPS_CHECK_TIMEOUT, false)
-    return ok and x ~= nil and y ~= nil and z ~= nil
+    local ok, x, y, z = pcall(gps.locate, timeout, false)
+    if not ok or type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
+        return nil
+    end
+
+    return util.Vector3.new(x, y, z)
+end
+
+local function positionsMatch(first, second)
+    return math.abs(first.x - second.x) <= GPS_POSITION_TOLERANCE and
+        math.abs(first.y - second.y) <= GPS_POSITION_TOLERANCE and
+        math.abs(first.z - second.z) <= GPS_POSITION_TOLERANCE
 end
 
 local function verifyGpsCalibration()
     -- Do not probe GPS until a calibration exists to invalidate.
-    if not task.isCalibrated() or gpsAvailable() then
+    if not task.isCalibrated() then
+        gpsMissCount = 0
+        return true
+    end
+
+    local gpsPosition = locateGps(GPS_CHECK_TIMEOUT)
+    if gpsPosition and positionsMatch(gpsPosition, task.getPosition()) then
         gpsMissCount = 0
         return true
     end
@@ -233,9 +260,9 @@ local function verifyGpsCalibration()
     task.invalidateCalibration()
 
     if task.save() then
-        setWarning("GPS lost. Recalibrate.")
+        setWarning(gpsPosition and "GPS position changed. Recalibrate." or "GPS lost. Recalibrate.")
     else
-        setWarning("GPS lost; save failed.")
+        setWarning(gpsPosition and "GPS position changed; save failed." or "GPS lost; save failed.")
     end
 
     return false
@@ -251,10 +278,50 @@ local function resetAndSave(message)
     return true, message:gsub("%.$", "") .. "; save failed."
 end
 
+local function validateLoadedCalibration()
+    if not task.isCalibrated() then
+        return nil
+    end
+
+    local gpsPosition = locateGps(conf.get("startup.gpsTimeout", 2))
+    if gpsPosition and positionsMatch(gpsPosition, task.getPosition()) then
+        return nil
+    end
+
+    task.invalidateCalibration()
+    local saved = task.save()
+    local message = gpsPosition and "Stored position does not match GPS. Recalibrate." or
+        "GPS unavailable. Recalibrate."
+
+    if not saved then
+        message = message:gsub("%.$", "") .. "; save failed."
+    end
+
+    return message
+end
+
+local function combineStatusMessages(first, second)
+    first, second = trim(first), trim(second)
+    if first == "" then return second end
+    if second == "" then return first end
+    return first:gsub("[%.!?]$", "") .. "; " .. second
+end
+
+local function startupMessageIsWarning(message)
+    message = string.lower(tostring(message or ""))
+    return message:find("failed", 1, true) ~= nil or
+        message:find("backup", 1, true) ~= nil or
+        message:find("recalibrate", 1, true) ~= nil
+end
+
 local function initializeRuntime()
     local configReady, configMessage = conf.initialize()
     if not configReady then
         return false, "Configuration initialization failed: " .. tostring(configMessage)
+    end
+
+    local function withConfigMessage(message)
+        return combineStatusMessages(configMessage, message)
     end
 
     applyColorConfiguration()
@@ -264,20 +331,22 @@ local function initializeRuntime()
 
     if conf.get("startup.loadTaskState", true) ~= true then
         task.reset()
-        return true, "Fresh state."
+        return true, withConfigMessage("Fresh state.")
     end
 
     local statePath = task.getStoragePath()
     if not fs.exists(statePath) and not fs.exists(statePath .. ".bak") then
-        return resetAndSave("Fresh state.")
+        local success, message = resetAndSave("Fresh state.")
+        return success, withConfigMessage(message)
     end
 
     local loaded, loadMessage = task.load()
     if loaded then
-        return true, loadMessage or "State loaded."
+        return true, withConfigMessage(validateLoadedCalibration() or loadMessage or "State loaded.")
     end
 
-    return resetAndSave("Invalid state reset.")
+    local success, message = resetAndSave("Invalid state reset.")
+    return success, withConfigMessage(message)
 end
 
 local function movementAction(direction, count)
@@ -335,10 +404,12 @@ local function executeMovement(direction, count)
     if finalWarning then
         return true, finalWarning, true
     elseif count == 1 then
-        return true, "Moved " .. direction .. ".", false
+        local verb = (direction == "left" or direction == "right") and "Turned" or "Moved"
+        return true, verb .. " " .. direction .. ".", false
     end
 
-    return true, "Moved " .. direction .. " x" .. count .. ".", false
+    local verb = (direction == "left" or direction == "right") and "Turned" or "Moved"
+    return true, verb .. " " .. direction .. " x" .. count .. ".", false
 end
 
 local function reportOperation(success, message, successMessage, errorMessage)
@@ -402,6 +473,9 @@ local function executeAction(action)
         end
 
         local success, message = mvmt.calibrate(digAllowed)
+        -- gps.locate consumes timer events internally, including our periodic
+        -- check timer, so every calibration attempt needs a fresh interval.
+        restartGpsTimer()
         if success then
             gpsMissCount = 0
         end
@@ -409,25 +483,26 @@ local function executeAction(action)
         return reportOperation(success, message, "GPS calibrated.", "Calibration failed.")
     elseif actionType == "reset_position" then
         task.setPosition(0, 0, 0)
+        task.invalidateCalibration()
 
         if task.save() then
-            setSuccess("Relative position reset.")
+            setSuccess("Position reset. Recalibrate.")
         else
-            setWarning("Relative position reset; save failed.")
+            setWarning("Position reset; save failed.")
         end
 
         return true
     elseif actionType == "refuel" then
-        local success, value1, value2 = fuel.refuel(action.percent)
+        local success, value1 = fuel.refuel(action.percent)
         if not success then
             setError(value1 or "Refuel failed.")
             return false
         end
 
-        local fuelAdded, itemsUsed = value1 or 0, value2 or 0
+        local fuelAdded = value1 or 0
         if fuelAdded == math.huge then
             setSuccess("Fuel unlimited.")
-        elseif itemsUsed > 0 then
+        elseif fuelAdded > 0 then
             setSuccess("Refueled +" .. fuelAdded .. ".")
         else
             setSuccess("Fuel already sufficient.")
@@ -515,6 +590,12 @@ local function parseCommand(input)
     input = trim(input)
     if input == "" then
         return nil
+    elseif input:sub(1, 1) == "!" then
+        local shellInput = trim(input:sub(2))
+        if shellInput == "" then
+            return nil, "Usage: !<command>"
+        end
+        return nil, nil, shellInput
     end
 
     local words = util.splitString(input)
@@ -528,10 +609,12 @@ local function parseCommand(input)
         end
 
         return movementAction(direction, count)
-    elseif command == "turn" and words[2] then
-        local turnDirection = string.lower(words[2])
-        if turnDirection == "left" or turnDirection == "right" then
-            return movementAction(turnDirection)
+    elseif command == "turn" then
+        if words[2] then
+            local turnDirection = string.lower(words[2])
+            if turnDirection == "left" or turnDirection == "right" then
+                return movementAction(turnDirection)
+            end
         end
 
         return nil, "Usage: turn left/right"
@@ -576,7 +659,7 @@ local function parseCommand(input)
         return simpleAction(actionType)
     end
 
-    return nil, 'Unknown command "' .. command .. '".'
+    return nil, nil, true
 end
 
 local HELP_LINES = {
@@ -615,10 +698,47 @@ local function showHelp()
     restartGpsTimer()
 end
 
+local function executeShellCommand(input)
+    clearScreen()
+
+    -- shell.run parses the complete line just like the CraftOS prompt, so
+    -- aliases, arguments, and programs elsewhere on the shell path still work.
+    local callSucceeded, commandSucceeded = pcall(shell.run, input)
+    resetColors()
+
+    if not callSucceeded then
+        printError(tostring(commandSucceeded))
+    elseif not commandSucceeded then
+        printError("Command failed.")
+    end
+
+    print()
+    term.setTextColor(COLOR_MUTED)
+    print("Press any key or click to return.")
+    resetColors()
+
+    while true do
+        local event = os.pullEvent()
+        if event == "key" or event == "mouse_click" then
+            break
+        end
+    end
+
+    if callSucceeded and commandSucceeded then
+        setSuccess("Command completed.")
+    else
+        setError("Command failed.")
+    end
+
+    restartGpsTimer()
+end
+
 local function executeCommand(input)
-    local action, reason = parseCommand(input)
+    local action, reason, runInShell = parseCommand(input)
     if not action then
-        if reason then
+        if runInShell then
+            executeShellCommand(type(runInShell) == "string" and runInShell or input)
+        elseif reason then
             setError(reason)
         end
 
@@ -840,7 +960,11 @@ local function main()
     end
 
     if message then
-        setStatus(message, COLOR_TEXT)
+        if startupMessageIsWarning(message) then
+            setWarning(message)
+        else
+            setStatus(message, COLOR_TEXT)
+        end
     end
 
     restartGpsTimer()
