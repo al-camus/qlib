@@ -11,6 +11,8 @@ fuel policy, smart movement, and a UI control panel.
 Relative movement remains available without GPS. Fuel checks, reserve protection,
 dig blacklisting, and state checkpoints are handled by the movement layer.
 
+<img width="476" height="242" alt="Screenshot 2026-08-12 at 10 18 18 PM" src="https://github.com/user-attachments/assets/8f853dd5-4f80-4e95-9886-aa7962883452" />
+
 ## Modules
 
 - `conf.lua` — store and load qlib settings
