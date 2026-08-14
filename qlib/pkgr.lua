@@ -1,6 +1,7 @@
-local parentEnv = _ENV or getfenv()
+-- qlib-release: 2
+local parentEnv = _ENV
 local qEnv = setmetatable({}, { __index = parentEnv })
-setfenv(1, qEnv)
+_ENV = qEnv
 
 local function assertTable(value, name)
     if type(value) ~= "table" then
@@ -50,9 +51,7 @@ end
 
 function startModule(env)
     assertTable(env, "module environment")
-    local moduleEnv = setmetatable({}, { __index = env })
-    setfenv(2, moduleEnv)
-    return moduleEnv
+    return setmetatable({}, { __index = env })
 end
 
 function endModule(env)
@@ -170,4 +169,4 @@ function pack(inputDirectory, outputFile)
     return true, packedCount
 end
 
-return endModule(getfenv())
+return endModule(_ENV)
