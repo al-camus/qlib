@@ -1,5 +1,6 @@
+-- qlib-release: 2
 local pkgr = require "qlib.pkgr"
-pkgr.startModule(_ENV or getfenv())
+_ENV = pkgr.startModule(_ENV)
 
 local function assertNumber(value, name, level)
     if type(value) ~= "number" then
@@ -371,4 +372,4 @@ function Vector3:getAdjacentPos(direction, rotation)
     error('unsupported direction "' .. tostring(direction) .. '"', 2)
 end
 
-return pkgr.endModule(getfenv())
+return pkgr.endModule(_ENV)
