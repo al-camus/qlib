@@ -1,9 +1,11 @@
+-- qlib-release: 2
 local pkgr = require "qlib.pkgr"
-pkgr.startModule(_ENV or getfenv())
+_ENV = pkgr.startModule(_ENV)
 
 local util = require "qlib.util"
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
+LEGACY_CONFIG_VERSION = 1
 DEFAULT_STORAGE_PATH = ".rcgpt/conf.cfg"
 
 local coreDefaults = {
@@ -268,18 +270,23 @@ end
 
 local function migrateLegacyFuelPolicy(storedValues)
     local storedFuel = type(storedValues) == "table" and storedValues.fuel
-    if type(storedFuel) ~= "table" or storedFuel.autoRefuelPercent ~= nil then
+    if type(storedFuel) ~= "table" then
         return false
     end
 
-    -- A missing threshold identifies the legacy policy. Its old 100-unit
-    -- default reserve would prevent emergency-only refueling from ever being
-    -- reached, so migrate that value while preserving all other custom fields.
-    if storedFuel.reserve == 100 then
-        storedFuel.reserve = 0
+    local migrated = false
+    if storedFuel.autoRefuelPercent == nil then
+        -- A missing threshold identifies the legacy policy. Its old 100-unit
+        -- default reserve would prevent emergency-only refueling from ever
+        -- being reached, so migrate it while preserving custom values.
+        if storedFuel.reserve == 100 then
+            storedFuel.reserve = 0
+        end
+        storedFuel.autoRefuelPercent = -1
+        migrated = true
     end
-    storedFuel.autoRefuelPercent = -1
-    return true
+
+    return migrated
 end
 
 local function decodeConfig(path)
@@ -297,13 +304,14 @@ local function decodeConfig(path)
     local ok, decoded = pcall(textutils.unserialize, contents)
     if not ok or type(decoded) ~= "table" then
         return nil, 'Unable to deserialize configuration "' .. path .. '"'
-    elseif decoded.version ~= CONFIG_VERSION then
+    elseif decoded.version ~= CONFIG_VERSION and decoded.version ~= LEGACY_CONFIG_VERSION then
         return nil, "unsupported configuration version: " .. tostring(decoded.version)
     elseif type(decoded.values) ~= "table" then
         return nil, "configuration contains no values table"
     end
 
-    local migrated = migrateLegacyFuelPolicy(decoded.values)
+    local migrated = decoded.version == LEGACY_CONFIG_VERSION
+    migrated = migrateLegacyFuelPolicy(decoded.values) or migrated
     return decoded.values, nil, migrated
 end
 
@@ -516,7 +524,7 @@ function load(path)
 
         values = merged
         dirty = migrated == true
-        return true, migrated and "Migrated legacy fuel defaults" or nil
+        return true, migrated and "Migrated configuration to version " .. CONFIG_VERSION or nil
     end
 
     local backupValues, _, backupMigrated = decodeConfig(targetPath .. ".bak")
@@ -529,7 +537,7 @@ function load(path)
         values = merged
         dirty = true
         return true, backupMigrated and
-            "Loaded configuration from backup and migrated legacy fuel defaults" or
+            "Loaded configuration from backup and migrated it to version " .. CONFIG_VERSION or
             "Loaded configuration from backup"
     end
 
@@ -566,4 +574,4 @@ function initialize(path)
     return true, "Created default configuration"
 end
 
-return pkgr.endModule(getfenv())
+return pkgr.endModule(_ENV)
