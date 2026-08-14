@@ -1,5 +1,6 @@
+-- qlib-release: 2
 local pkgr = require "qlib.pkgr"
-pkgr.startModule(_ENV or getfenv())
+_ENV = pkgr.startModule(_ENV)
 
 local conf = require "qlib.conf"
 
@@ -376,7 +377,7 @@ function require(steps)
     local automaticPercent = autoRefuelPercent()
     local fuelLimit = rawLimit()
     local shouldRefuel = normalized > 0 and autoRefuelEnabled() and (
-        (automaticPercent < 0 and fuelLevel <= 0) or
+        (automaticPercent < 0 and not canProceed) or
         (automaticPercent > 0 and percentFor(fuelLevel, fuelLimit) < automaticPercent)
     )
 
@@ -422,4 +423,4 @@ function getState()
     }
 end
 
-return pkgr.endModule(getfenv())
+return pkgr.endModule(_ENV)
