@@ -1,5 +1,6 @@
+-- qlib-release: 2
 local pkgr = require "qlib.pkgr"
-pkgr.startModule(_ENV or getfenv())
+_ENV = pkgr.startModule(_ENV)
 
 local util = require "qlib.util"
 local task = require "qlib.task"
@@ -19,9 +20,13 @@ local moveRaw = {
 local inspectRaw = { forward = turtle.inspect, up = turtle.inspectUp, down = turtle.inspectDown }
 local digRaw = { forward = turtle.dig, up = turtle.digUp, down = turtle.digDown }
 local attackRaw = { forward = turtle.attack, up = turtle.attackUp, down = turtle.attackDown }
+local placeRaw = { forward = turtle.place, up = turtle.placeUp, down = turtle.placeDown }
 local moveDirections = { forward = true, back = true, left = true, right = true, up = true, down = true }
 
 local blacklistOverride
+local parked = false
+
+PARKED_MESSAGE = "Turtle is parked."
 
 local function isFiniteNumber(value)
     return type(value) == "number" and value == value and
@@ -53,7 +58,10 @@ end
 
 local function requireMovementFuel(steps)
     local success, reason = fuel.require(steps)
-    return success, success and nil or reason or "Insufficient fuel"
+    if success then
+        return true
+    end
+    return false, reason or "Insufficient fuel"
 end
 
 local function checkpointState()
@@ -62,7 +70,10 @@ local function checkpointState()
     end
 
     local success, reason = task.save()
-    return success, success and nil or reason or "Unable to save task state"
+    if success then
+        return true
+    end
+    return false, reason or "Unable to save task state"
 end
 
 local function finishStateChange(context)
@@ -149,6 +160,19 @@ end
 
 function isUsingBlacklistOverride()
     return blacklistOverride ~= nil
+end
+
+function isParked()
+    return parked
+end
+
+function setParked(value)
+    if type(value) ~= "boolean" then
+        error("parked must be a boolean, got " .. type(value), 2)
+    end
+
+    parked = value
+    return true
 end
 
 function safeDig(direction)
@@ -297,6 +321,11 @@ function go(direction, digAllowed)
     if not normalized then
         return false, 'Unknown direction "' .. tostring(direction) .. '"'
     end
+
+    if parked and normalized ~= "left" and normalized ~= "right" then
+        return false, PARKED_MESSAGE
+    end
+
     if util.isHorizontalDirection(normalized) then
         return goCardinal(normalized, digAllowed)
     end
@@ -360,6 +389,260 @@ function face(rotation)
     return true, secondWarning or firstWarning
 end
 
+local function resolvePlacementDirection(direction)
+    local normalized = util.normalizeDirection(direction)
+    if not normalized then
+        return nil, 'Unknown placement direction "' .. tostring(direction) .. '"'
+    end
+
+    if util.isHorizontalDirection(normalized) then
+        if not task.isCalibrated() then
+            return nil, "Cannot place in an absolute direction while uncalibrated"
+        end
+
+        local current = task.getRotation()
+        if normalized == current then
+            return "forward"
+        elseif util.cardinal_left[current] == normalized then
+            return "left"
+        elseif util.cardinal_right[current] == normalized then
+            return "right"
+        elseif util.cardinal_reverse[current] == normalized then
+            return "back"
+        end
+    elseif placeRaw[normalized] or normalized == "left" or normalized == "right" or normalized == "back" then
+        return normalized
+    end
+
+    return nil, 'Unsupported placement direction "' .. tostring(direction) .. '"'
+end
+
+local function resolveDigDirection(direction)
+    local normalized = util.normalizeDirection(direction)
+    if not normalized then
+        return nil, 'Unknown dig direction "' .. tostring(direction) .. '"'
+    end
+
+    if util.isHorizontalDirection(normalized) then
+        if not task.isCalibrated() then
+            return nil, "Cannot dig in an absolute direction while uncalibrated"
+        end
+
+        local current = task.getRotation()
+        if normalized == current then
+            return "forward"
+        elseif util.cardinal_left[current] == normalized then
+            return "left"
+        elseif util.cardinal_right[current] == normalized then
+            return "right"
+        elseif util.cardinal_reverse[current] == normalized then
+            return "back"
+        end
+    elseif digRaw[normalized] or normalized == "left" or normalized == "right" or normalized == "back" then
+        return normalized
+    end
+
+    return nil, 'Unsupported dig direction "' .. tostring(direction) .. '"'
+end
+
+local interactionTurns = {
+    left = { direction = "left", count = 1, restore = "right" },
+    right = { direction = "right", count = 1, restore = "left" },
+    back = { direction = "right", count = 2, restore = "left" }
+}
+
+local function addMessage(messages, message)
+    if message and message ~= "" then
+        messages[#messages + 1] = tostring(message)
+    end
+end
+
+function place(direction, text)
+    local resolved, resolveError = resolvePlacementDirection(direction)
+    if not resolved then
+        return false, resolveError
+    end
+
+    local placeFunction = placeRaw[resolved]
+    if placeFunction then
+        local success, reason = placeFunction(text)
+        if success then
+            return true
+        end
+        return false, reason or "Unable to place block " .. resolved
+    end
+
+    local plan = interactionTurns[resolved]
+    local warnings, turnErrors, completedTurns = {}, {}, 0
+    for _ = 1, plan.count do
+        local turned, message = go(plan.direction)
+        if not turned then
+            addMessage(turnErrors, message or "Unable to turn " .. plan.direction)
+            break
+        end
+        completedTurns = completedTurns + 1
+        addMessage(warnings, message)
+    end
+
+    local placed, placeError = false, nil
+    if completedTurns == plan.count then
+        placed, placeError = placeRaw.forward(text)
+        if not placed then
+            placeError = placeError or "Unable to place block " .. resolved
+        end
+    else
+        placeError = "Unable to face placement direction"
+    end
+
+    local restoreErrors = {}
+    for _ = 1, completedTurns do
+        local restored, message = go(plan.restore)
+        if restored then
+            addMessage(warnings, message)
+        else
+            addMessage(restoreErrors, message or "Unable to turn " .. plan.restore)
+            break
+        end
+    end
+
+    local finalSaveError
+    if task.isDirty() then
+        local finalSaved
+        finalSaved, finalSaveError = task.save()
+        if finalSaved then
+            finalSaveError = nil
+        end
+    end
+
+    if #restoreErrors > 0 then
+        local restoreMessage = "orientation could not be restored: " .. table.concat(restoreErrors, "; ")
+        if finalSaveError then
+            restoreMessage = restoreMessage .. "; state save failed: " .. tostring(finalSaveError)
+        end
+        if placed then
+            local messages = { "Block placed, but " .. restoreMessage }
+            for _, message in ipairs(warnings) do
+                addMessage(messages, message)
+            end
+            return true, table.concat(messages, "; ")
+        end
+        local errors = { tostring(placeError) }
+        for _, message in ipairs(turnErrors) do
+            addMessage(errors, message)
+        end
+        addMessage(errors, restoreMessage)
+        return false, table.concat(errors, "; ")
+    elseif not placed then
+        local errors = { tostring(placeError) }
+        for _, message in ipairs(turnErrors) do
+            addMessage(errors, message)
+        end
+        if finalSaveError then
+            addMessage(errors, "state save failed: " .. tostring(finalSaveError))
+        end
+        return false, table.concat(errors, "; ")
+    elseif #warnings > 0 or finalSaveError then
+        if finalSaveError then
+            addMessage(warnings, "state save failed: " .. tostring(finalSaveError))
+        end
+        return true, table.concat(warnings, "; ")
+    end
+
+    return true
+end
+
+function dig(direction)
+    local resolved, resolveError = resolveDigDirection(direction)
+    if not resolved then
+        return false, resolveError
+    end
+
+    if digRaw[resolved] then
+        return safeDig(resolved)
+    end
+
+    local plan = interactionTurns[resolved]
+    local warnings, turnErrors, completedTurns = {}, {}, 0
+
+    for _ = 1, plan.count do
+        local turned, message = go(plan.direction)
+        if not turned then
+            addMessage(turnErrors, message or "Unable to turn " .. plan.direction)
+            break
+        end
+        completedTurns = completedTurns + 1
+        addMessage(warnings, message)
+    end
+
+    local dug, digError = false, nil
+    if completedTurns == plan.count then
+        dug, digError = safeDig("forward")
+        if not dug then
+            digError = digError or "Unable to dig block " .. resolved
+        end
+    else
+        digError = "Unable to face dig direction"
+    end
+
+    local restoreErrors = {}
+    for _ = 1, completedTurns do
+        local restored, message = go(plan.restore)
+        if restored then
+            addMessage(warnings, message)
+        else
+            addMessage(restoreErrors, message or "Unable to turn " .. plan.restore)
+            break
+        end
+    end
+
+    local finalSaveError
+    if task.isDirty() then
+        local finalSaved
+        finalSaved, finalSaveError = task.save()
+        if finalSaved then
+            finalSaveError = nil
+        end
+    end
+
+    if #restoreErrors > 0 then
+        local restoreMessage = "orientation could not be restored: " .. table.concat(restoreErrors, "; ")
+        if finalSaveError then
+            restoreMessage = restoreMessage .. "; state save failed: " .. tostring(finalSaveError)
+        end
+
+        if dug then
+            local messages = { "Dig completed, but " .. restoreMessage }
+            for _, message in ipairs(warnings) do
+                addMessage(messages, message)
+            end
+            return true, table.concat(messages, "; ")
+        end
+
+        local errors = { tostring(digError) }
+        for _, message in ipairs(turnErrors) do
+            addMessage(errors, message)
+        end
+        addMessage(errors, restoreMessage)
+        return false, table.concat(errors, "; ")
+    elseif not dug then
+        local errors = { tostring(digError) }
+        for _, message in ipairs(turnErrors) do
+            addMessage(errors, message)
+        end
+        if finalSaveError then
+            addMessage(errors, "state save failed: " .. tostring(finalSaveError))
+        end
+        return false, table.concat(errors, "; ")
+    elseif #warnings > 0 or finalSaveError then
+        if finalSaveError then
+            addMessage(warnings, "state save failed: " .. tostring(finalSaveError))
+        end
+        return true, table.concat(warnings, "; ")
+    end
+
+    return true
+end
+
 function goCardinal(direction, digAllowed)
     local cardinal = normalizeCardinal(direction)
     if not cardinal then
@@ -380,6 +663,11 @@ function east(digAllowed) return goCardinal("east", digAllowed) end
 function west(digAllowed) return goCardinal("west", digAllowed) end
 
 function goUntilSuccess(direction, digAllowed, maxAttempts)
+    local normalized = util.normalizeDirection(direction)
+    if parked and normalized ~= "left" and normalized ~= "right" then
+        return false, PARKED_MESSAGE, 0
+    end
+
     maxAttempts = maxAttempts == nil and getConfiguredMaxAttempts() or maxAttempts
     if maxAttempts ~= math.huge then
         if not isFiniteNumber(maxAttempts) then
@@ -416,32 +704,68 @@ local function locate(timeout)
 end
 
 local function findClearCalibrationDirection(digAllowed)
+    local completedTurns = 0
     for _ = 1, 4 do
         if not turtle.detect() then
-            return true
+            return true, nil, completedTurns
         end
         if not moveRaw.right() then
-            return false, "Unable to turn during calibration"
+            return false, "Unable to turn during calibration", completedTurns
         end
+        completedTurns = completedTurns + 1
     end
     if not digAllowed then
-        return false, "Unable to find a clear horizontal calibration direction"
+        return false, "Unable to find a clear horizontal calibration direction", completedTurns
     end
 
     for _ = 1, 4 do
         local cleared = safeDig("forward")
         if cleared and not turtle.detect() then
-            return true
+            return true, nil, completedTurns
         end
         if not moveRaw.right() then
-            return false, "Unable to turn during calibration"
+            return false, "Unable to turn during calibration", completedTurns
+        end
+        completedTurns = completedTurns + 1
+    end
+    return false, "Unable to find a clear horizontal calibration direction", completedTurns
+end
+
+local function restoreCalibrationPose(completedTurns, movedForward)
+    local problems = {}
+    if movedForward then
+        local returned, reason = moveRaw.back()
+        if not returned then
+            problems[#problems + 1] = reason or "unable to return from calibration probe"
         end
     end
-    return false, "Unable to find a clear horizontal calibration direction"
+
+    local turnsToRestore = completedTurns % 4
+    if turnsToRestore > 0 then
+        local restored, restoredTurns = rawTurn("left", turnsToRestore)
+        if not restored then
+            problems[#problems + 1] = "restored only " .. restoredTurns .. "/" .. turnsToRestore ..
+                " calibration turns"
+        end
+    end
+
+    return #problems == 0, table.concat(problems, "; ")
+end
+
+local function withCalibrationCleanup(message, completedTurns, movedForward)
+    local restored, restoreError = restoreCalibrationPose(completedTurns, movedForward)
+    if restored then
+        return message
+    end
+    return message .. "; cleanup failed: " .. restoreError
 end
 
 -- Reserve the outward and return steps before invalidating the existing calibration.
 function calibrate(digAllowed, timeout)
+    if parked then
+        return false, PARKED_MESSAGE
+    end
+
     if not gps or type(gps.locate) ~= "function" then
         return false, "GPS API is unavailable"
     end
@@ -455,8 +779,11 @@ function calibrate(digAllowed, timeout)
     if not fuelReady then
         return false, "Unable to safely begin calibration: " .. tostring(fuelReason)
     end
+    local priorRelativePosition = task.getRelativePosition()
     task.invalidateCalibration()
-    local saved, saveReason = checkpointState()
+    -- Calibration boundaries are safety-critical and must be durable even
+    -- when ordinary per-move checkpoints are disabled.
+    local saved, saveReason = task.save()
     if not saved then
         return false, "Unable to safely begin calibration: " .. tostring(saveReason)
     end
@@ -465,9 +792,9 @@ function calibrate(digAllowed, timeout)
     if not startPosition then
         return false, "Unable to acquire initial GPS position"
     end
-    local directionFound, directionReason = findClearCalibrationDirection(digAllowed)
+    local directionFound, directionReason, completedTurns = findClearCalibrationDirection(digAllowed)
     if not directionFound then
-        return false, directionReason
+        return false, withCalibrationCleanup(directionReason, completedTurns, false)
     end
 
     local moved, moveReason = moveRaw.forward()
@@ -475,30 +802,58 @@ function calibrate(digAllowed, timeout)
         moved, moveReason = moveRaw.forward()
     end
     if not moved then
-        return false, moveReason or "Unable to move during calibration"
+        return false, withCalibrationCleanup(
+            moveReason or "Unable to move during calibration",
+            completedTurns,
+            false
+        )
     end
 
     local newPosition = locate(timeout)
     if not newPosition then
-        moveRaw.back()
-        return false, "Unable to acquire second GPS position"
+        return false, withCalibrationCleanup(
+            "Unable to acquire second GPS position",
+            completedTurns,
+            true
+        )
     end
     local rotation = startPosition:cardinalTo(newPosition)
     if not rotation or not util.isHorizontalDirection(rotation) then
-        moveRaw.back()
-        return false, "GPS displacement did not produce a valid horizontal direction"
+        return false, withCalibrationCleanup(
+            "GPS displacement did not produce a valid horizontal direction",
+            completedTurns,
+            true
+        )
     end
 
+    if not task.hasRelativeOrigin() then
+        task.setRelativeOrigin(startPosition - priorRelativePosition)
+    end
     task.setState(newPosition, rotation, true)
-    local calibrationSaved, calibrationSaveReason = checkpointState()
+    local calibrationSaved, calibrationSaveReason = task.save()
     local returned, returnWarning = back(false)
+    if not task.isCalibrated() then
+        local forcedSaved, forcedSaveError = task.save()
+        local invalidMessage = returnWarning or "Calibration return left the turtle's orientation uncertain"
+        if not forcedSaved then
+            invalidMessage = invalidMessage .. "; state save failed: " .. tostring(forcedSaveError)
+        end
+        return false, invalidMessage
+    end
     if not returned then
+        local probeSaved, probeSaveError = task.save()
         local warning = "Calibration succeeded at " .. task.getPosition():strXYZ(task.getRotation()) ..
             ", but the turtle could not return to its starting position"
-        if calibrationSaveReason then
+        if not probeSaved then
+            warning = warning .. "; calibrated state save failed: " .. tostring(probeSaveError)
+        elseif calibrationSaveReason then
             warning = warning .. "; calibrated state checkpoint failed: " .. tostring(calibrationSaveReason)
         end
         return true, warning
+    end
+    local finalSaved, finalSaveReason = task.save()
+    if not finalSaved then
+        return true, "Calibration succeeded, but the final state save failed: " .. tostring(finalSaveReason)
     end
     if returnWarning then
         return true, returnWarning
@@ -527,10 +882,10 @@ function followRoute(route, digAllowed)
     end
 
     local stepNumber, warnings = 0, {}
-    for character in route:gmatch(".") do
-        if not character:match("%s") then
+    for routeCharacter in route:gmatch(".") do
+        if not routeCharacter:match("%s") then
             stepNumber = stepNumber + 1
-            character = string.lower(character)
+            local character = string.lower(routeCharacter)
             local action = routeActions[character]
             if not action then
                 return false, 'Invalid route character "' .. character .. '" at step ' .. stepNumber,
@@ -612,4 +967,4 @@ function getAdjacentPos(direction)
     return task.getPosition():getAdjacentPos(direction, task.getRotation())
 end
 
-return pkgr.endModule(getfenv())
+return pkgr.endModule(_ENV)
