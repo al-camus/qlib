@@ -11,7 +11,7 @@ fuel policy, smart movement, and a UI control panel.
 Relative movement remains available without GPS. Fuel checks, reserve protection,
 dig blacklisting, and state checkpoints are handled by the movement layer.
 
-<img width="476" height="242" alt="Screenshot 2026-08-12 at 10 18 18 PM" src="https://github.com/user-attachments/assets/8f853dd5-4f80-4e95-9886-aa7962883452" />
+<img width="476" height="242" alt="image" src="https://github.com/user-attachments/assets/23aa783c-a487-408a-b99c-0a3f19d9a41f" />
 
 ## Modules
 
@@ -26,10 +26,10 @@ dig blacklisting, and state checkpoints are handled by the movement layer.
 
 ## Running
 
-Install this directory as `qlib` on the turtle, then run:
+Install this directory as `./qlib` on the turtle, and run main in the root directory:
 
 ```text
-qlib/main
+./main
 ```
 
 The first run creates `.rcgpt/conf.cfg` and `.rcgpt/task.state` in the current
